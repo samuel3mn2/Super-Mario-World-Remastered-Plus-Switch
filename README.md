@@ -28,6 +28,13 @@ forwarder, so the port runs with full RAM. It will not work in applet/album mode
 
 Saves and `config.txt` live in `/switch/smwr_nx/save/`.
 
+### Local multiplayer
+
+The port exposes up to eight independently connected Switch controllers to
+Godot. Connect every player from the Switch controller screen before starting
+the game; each controller is delivered to the game as a separate Godot input
+device. Handheld mode and the first paired controller remain player one.
+
 ### How to build
 
 You need devkitA64 (devkitPro) with these packages:
