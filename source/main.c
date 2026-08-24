@@ -4,8 +4,8 @@
  * Loads the arm64-v8a libc++_shared.so + libgodot_android.so pair, provides a
  * minimal Android-like environment (fake JNI, libc/GLES3/EGL import table),
  * owns the EGL/GLES3 context, and drives the GodotLib native lifecycle
- * (initialize/setup/newcontext/resize/step) plus joypad/touch input from the
- * Switch pad and touchscreen.
+ * (initialize/setup/newcontext/resize/step) plus controller/touch input from
+ * Switch controllers and the touchscreen.
  *
  * MIT license; see LICENSE. */
 
@@ -233,7 +233,7 @@ static void resolve_entry_points(void) {
 }
 
 // ---------------------------------------------------------------------------
-// input: Switch pad + touchscreen -> Godot JoyButton/JoyAxis/touch events.
+// input: Switch controllers + touchscreen -> Godot JoyButton/JoyAxis/touch events.
 // The android Java layer translates keycodes into Godot's own enums before
 // crossing into native code, so we emit Godot indices directly.
 // ---------------------------------------------------------------------------
@@ -260,13 +260,20 @@ static void resolve_entry_points(void) {
 #define GD_AXIS_LT 4
 #define GD_AXIS_RT 5
 
-static PadState pad;
+#define MAX_GAMEPADS 8
+
+// Slot 0 combines handheld mode and Npad No.1 (the normal single-player
+// setup). The remaining slots map one-to-one to Npad No.2 through No.8, so
+// Godot can give every local player its own device ID.
+static PadState s_pads[MAX_GAMEPADS];
 
 // label mapping (Switch A -> Godot A, ...): with the game's ui_accept on
 // Godot A and ui_back on Godot B this gives standard Switch menu behavior
 // (A confirms, B backs out). Gameplay actions are tuned via the redirected
 // input .tres resources in assets/smwr_inputs/ (jump=B, spin=A, run=X/Y).
-static struct { u64 sw; int btn; } s_btnmap[] = {
+typedef struct { u64 sw; int btn; } ButtonMap;
+
+static const ButtonMap s_btnmap[] = {
   { HidNpadButton_A,      GD_JOY_A },        // east
   { HidNpadButton_B,      GD_JOY_B },        // south
   { HidNpadButton_X,      GD_JOY_X },        // north
@@ -283,9 +290,27 @@ static struct { u64 sw; int btn; } s_btnmap[] = {
   { HidNpadButton_Right,  GD_JOY_DPAD_RIGHT },
 };
 
-static u64 s_prev_buttons = 0;
+// A left Joy-Con used on its own has no A/B/X/Y face buttons. Its four
+// directional buttons become the action diamond while its analogue stick
+// remains movement. This is the layout used by the game for jump/spin/run.
+static const ButtonMap s_left_joy_btnmap[] = {
+  { HidNpadButton_Right,  GD_JOY_A },
+  { HidNpadButton_Down,   GD_JOY_B },
+  { HidNpadButton_Up,     GD_JOY_X },
+  { HidNpadButton_Left,   GD_JOY_Y },
+  { HidNpadButton_L,      GD_JOY_L1 },
+  { HidNpadButton_LeftSL, GD_JOY_L1 },
+  { HidNpadButton_LeftSR, GD_JOY_R1 },
+  { HidNpadButton_StickL, GD_JOY_LSTICK },
+  { HidNpadButton_Minus,  GD_JOY_BACK },
+};
+
+static u64 s_prev_buttons[MAX_GAMEPADS] = {0};
+static int s_pad_connected[MAX_GAMEPADS] = {0};
+static const ButtonMap *s_active_btnmap[MAX_GAMEPADS];
+static size_t s_active_btnmap_count[MAX_GAMEPADS];
 static int s_touching = 0;
-static float s_prev_axis[6] = { 99, 99, 99, 99, 99, 99 }; // force initial send
+static float s_prev_axis[MAX_GAMEPADS][6];
 
 static float stick_norm(s32 v) {
   float f = v / 32767.0f;
@@ -294,37 +319,98 @@ static float stick_norm(s32 v) {
   return f;
 }
 
-static void send_axis(void *cls, int axis, float v) {
-  if (v == s_prev_axis[axis]) return;
-  s_prev_axis[axis] = v;
-  if (e_joyaxis) e_joyaxis(fake_env, cls, 0, axis, v);
+static void send_axis(void *cls, int device, int axis, float v) {
+  if (v == s_prev_axis[device][axis]) return;
+  s_prev_axis[device][axis] = v;
+  if (e_joyaxis) e_joyaxis(fake_env, cls, device, axis, v);
+}
+
+static const ButtonMap *get_button_map(const PadState *pad, size_t *count) {
+  // The Joy-Con styles are mutually exclusive with a paired/Pro controller.
+  // Keep the full-controller mapping untouched for every other style.
+  if (padGetStyleSet(pad) & HidNpadStyleTag_NpadJoyLeft) {
+    *count = sizeof(s_left_joy_btnmap) / sizeof(*s_left_joy_btnmap);
+    return s_left_joy_btnmap;
+  }
+  *count = sizeof(s_btnmap) / sizeof(*s_btnmap);
+  return s_btnmap;
+}
+
+static void set_pad_connection(void *cls, int device, int connected,
+                               const ButtonMap *btnmap, size_t btnmap_count) {
+  if (connected == s_pad_connected[device]) return;
+
+  // A removed controller must release its state, otherwise Godot can retain
+  // a held direction or button until that player rejoins.
+  if (!connected) {
+    if (e_joybutton) {
+      for (size_t i = 0; i < s_active_btnmap_count[device]; i++) {
+        if (s_prev_buttons[device] & s_active_btnmap[device][i].sw)
+          e_joybutton(fake_env, cls, device, s_active_btnmap[device][i].btn, 0);
+      }
+    }
+    for (int axis = 0; axis < 6; axis++)
+      send_axis(cls, device, axis, 0.0f);
+    s_prev_buttons[device] = 0;
+  } else if (e_joyconnectionchanged) {
+    void *name = jni_new_string("Nintendo Switch Controller");
+    e_joyconnectionchanged(fake_env, cls, device, 1, name);
+    jni_release_local(name);
+  }
+
+  if (!connected && e_joyconnectionchanged)
+    e_joyconnectionchanged(fake_env, cls, device, 0, NULL);
+  s_pad_connected[device] = connected;
+  if (connected) {
+    s_active_btnmap[device] = btnmap;
+    s_active_btnmap_count[device] = btnmap_count;
+  }
 }
 
 static void poll_input(void) {
   void *cls = jni_activity_class();
-  padUpdate(&pad);
-  const u64 cur = padGetButtons(&pad);
 
-  if (e_joybutton) {
-    for (unsigned i = 0; i < sizeof(s_btnmap) / sizeof(*s_btnmap); i++) {
-      const u64 m = s_btnmap[i].sw;
-      if ((cur & m) && !(s_prev_buttons & m))      e_joybutton(fake_env, cls, 0, s_btnmap[i].btn, 1);
-      else if (!(cur & m) && (s_prev_buttons & m)) e_joybutton(fake_env, cls, 0, s_btnmap[i].btn, 0);
+  for (int device = 0; device < MAX_GAMEPADS; device++) {
+    PadState *pad = &s_pads[device];
+    padUpdate(pad);
+    const int connected = padIsConnected(pad);
+    size_t btnmap_count = 0;
+    const ButtonMap *btnmap = get_button_map(pad, &btnmap_count);
+    set_pad_connection(cls, device, connected, btnmap, btnmap_count);
+    if (!connected) continue;
+
+    const u64 cur = padGetButtons(pad);
+    if (e_joybutton) {
+      for (size_t i = 0; i < btnmap_count; i++) {
+        const u64 m = btnmap[i].sw;
+        if ((cur & m) && !(s_prev_buttons[device] & m))      e_joybutton(fake_env, cls, device, btnmap[i].btn, 1);
+        else if (!(cur & m) && (s_prev_buttons[device] & m)) e_joybutton(fake_env, cls, device, btnmap[i].btn, 0);
+      }
     }
+
+    // sticks: Godot's Android convention is Y-down-positive.
+    HidAnalogStickState l = padGetStickPos(pad, 0);
+    HidAnalogStickState r = padGetStickPos(pad, 1);
+    const u32 style = padGetStyleSet(pad);
+    if (style & HidNpadStyleTag_NpadJoyRight) {
+      // A single right Joy-Con owns stick #1. Present it as the primary
+      // stick so the game's normal movement bindings work for that player.
+      send_axis(cls, device, GD_AXIS_LX, stick_norm(r.x));
+      send_axis(cls, device, GD_AXIS_LY, -stick_norm(r.y));
+      send_axis(cls, device, GD_AXIS_RX, 0.0f);
+      send_axis(cls, device, GD_AXIS_RY, 0.0f);
+    } else {
+      send_axis(cls, device, GD_AXIS_LX, stick_norm(l.x));
+      send_axis(cls, device, GD_AXIS_LY, -stick_norm(l.y));
+      send_axis(cls, device, GD_AXIS_RX, stick_norm(r.x));
+      send_axis(cls, device, GD_AXIS_RY, -stick_norm(r.y));
+    }
+    // ZL/ZR as digital triggers
+    send_axis(cls, device, GD_AXIS_LT, (cur & HidNpadButton_ZL) ? 1.0f : 0.0f);
+    send_axis(cls, device, GD_AXIS_RT, (cur & HidNpadButton_ZR) ? 1.0f : 0.0f);
+
+    s_prev_buttons[device] = cur;
   }
-
-  // sticks: godot's android convention is Y-down-positive
-  HidAnalogStickState l = padGetStickPos(&pad, 0);
-  HidAnalogStickState r = padGetStickPos(&pad, 1);
-  send_axis(cls, GD_AXIS_LX, stick_norm(l.x));
-  send_axis(cls, GD_AXIS_LY, -stick_norm(l.y));
-  send_axis(cls, GD_AXIS_RX, stick_norm(r.x));
-  send_axis(cls, GD_AXIS_RY, -stick_norm(r.y));
-  // ZL/ZR as digital triggers
-  send_axis(cls, GD_AXIS_LT, (cur & HidNpadButton_ZL) ? 1.0f : 0.0f);
-  send_axis(cls, GD_AXIS_RT, (cur & HidNpadButton_ZR) ? 1.0f : 0.0f);
-
-  s_prev_buttons = cur;
 
   // single-finger touch, scaled from the 1280x720 panel to the surface size
   if (e_dispatchTouchEvent) {
@@ -448,7 +534,7 @@ static void game_thread_fn(void *arg) {
   debugPrintf(">> entering step loop\n");
   int frames = 0;
   int paused = 0;
-  int announced_pad = 0;
+  int input_ready = 0;
   // adaptive CPU boost: shader compilation and level loads are CPU-bound
   // stalls on mesa/nouveau. Any slow step re-arms the boost; it drops only
   // after ~10 s of smooth frames. Boot naturally keeps it armed throughout.
@@ -471,7 +557,7 @@ static void game_thread_fn(void *arg) {
       paused = 0;
     }
 
-    if (announced_pad) poll_input();
+    if (input_ready) poll_input();
 
     if (frames < 8) debugPrintf(">> step %d begin\n", frames + 1);
     const u64 t0 = armGetSystemTick();
@@ -483,7 +569,7 @@ static void game_thread_fn(void *arg) {
     if (step_ms > 50) { // stall (shader compile / load): burst the CPU
       calm_frames = 0;
       if (!boosted) { cpu_boost(1); boosted = 1; }
-      if (step_ms > 100 && announced_pad && s_stats && frames < 100000) {
+      if (step_ms > 100 && input_ready && s_stats && frames < 100000) {
         fprintf(s_stats, "stall %4llu ms  frame %d\n", (unsigned long long)step_ms, frames);
         fflush(s_stats); // we already dropped frames; one tiny write is noise
       }
@@ -496,15 +582,11 @@ static void game_thread_fn(void *arg) {
     s_frames_done = frames;
     if (frames == 1) stats_mark("step 1 (engine servers up)");
     if (frames == 4) stats_mark("step 4 (game scene running)");
-    if (!announced_pad && frames >= 4) {
-      // engine servers are up after the first steps; announce the pad once
-      if (e_joyconnectionchanged) {
-        void *name = jni_new_string("Nintendo Switch Controller");
-        e_joyconnectionchanged(fake_env, cls, 0, 1, name);
-        jni_release_local(name);
-      }
-      announced_pad = 1;
-      debugPrintf(">> pad announced after %d frames\n", frames);
+    if (!input_ready && frames >= 4) {
+      // The engine's input servers are available now. poll_input() announces
+      // every present controller and continues to track hot-plugging.
+      input_ready = 1;
+      debugPrintf(">> gamepad input enabled after %d frames\n", frames);
     }
   }
 
@@ -652,8 +734,13 @@ int main(void) {
   if (chdir(config.save_root) != 0)
     debugPrintf("!! chdir(%s) failed\n", config.save_root);
 
-  padConfigureInput(8, HidNpadStyleSet_NpadStandard);
-  padInitializeAny(&pad);
+  padConfigureInput(MAX_GAMEPADS, HidNpadStyleSet_NpadStandard);
+  padInitializeDefault(&s_pads[0]);
+  for (int device = 1; device < MAX_GAMEPADS; device++)
+    padInitialize(&s_pads[device], (HidNpadIdType)(HidNpadIdType_No1 + device));
+  for (int device = 0; device < MAX_GAMEPADS; device++)
+    for (int axis = 0; axis < 6; axis++)
+      s_prev_axis[device][axis] = 99.0f; // force initial state delivery
   hidInitializeTouchScreen();
 
   if (R_FAILED(threadCreate(&s_game_thread, game_thread_fn, NULL, NULL, 8 * 1024 * 1024, 0x2C, -2)))
