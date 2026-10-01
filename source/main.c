@@ -298,11 +298,23 @@ static const ButtonMap s_left_joy_btnmap[] = {
   { HidNpadButton_Down,   GD_JOY_B },
   { HidNpadButton_Up,     GD_JOY_X },
   { HidNpadButton_Left,   GD_JOY_Y },
-  { HidNpadButton_L,      GD_JOY_L1 },
   { HidNpadButton_LeftSL, GD_JOY_L1 },
   { HidNpadButton_LeftSR, GD_JOY_R1 },
   { HidNpadButton_StickL, GD_JOY_LSTICK },
-  { HidNpadButton_Minus,  GD_JOY_BACK },
+  { HidNpadButton_Minus,  GD_JOY_START },
+};
+
+// In horizontal mode the right Joy-Con uses its SL/SR rails for L/R.
+static const ButtonMap s_right_joy_btnmap[] = {
+  { HidNpadButton_A,       GD_JOY_A },
+  { HidNpadButton_B,       GD_JOY_B },
+  { HidNpadButton_X,       GD_JOY_X },
+  { HidNpadButton_Y,       GD_JOY_Y },
+  { HidNpadButton_RightSL, GD_JOY_L1 },
+  { HidNpadButton_RightSR, GD_JOY_R1 },
+  { HidNpadButton_StickR,  GD_JOY_LSTICK },
+  { HidNpadButton_Plus,    GD_JOY_START },
+  { HidNpadButton_Minus,   GD_JOY_BACK },
 };
 
 static u64 s_prev_buttons[MAX_GAMEPADS] = {0};
@@ -331,6 +343,10 @@ static const ButtonMap *get_button_map(const PadState *pad, size_t *count) {
   if (padGetStyleSet(pad) & HidNpadStyleTag_NpadJoyLeft) {
     *count = sizeof(s_left_joy_btnmap) / sizeof(*s_left_joy_btnmap);
     return s_left_joy_btnmap;
+  }
+  if (padGetStyleSet(pad) & HidNpadStyleTag_NpadJoyRight) {
+    *count = sizeof(s_right_joy_btnmap) / sizeof(*s_right_joy_btnmap);
+    return s_right_joy_btnmap;
   }
   *count = sizeof(s_btnmap) / sizeof(*s_btnmap);
   return s_btnmap;
@@ -393,10 +409,19 @@ static void poll_input(void) {
     HidAnalogStickState r = padGetStickPos(pad, 1);
     const u32 style = padGetStyleSet(pad);
     if (style & HidNpadStyleTag_NpadJoyRight) {
-      // A single right Joy-Con owns stick #1. Present it as the primary
-      // stick so the game's normal movement bindings work for that player.
-      send_axis(cls, device, GD_AXIS_LX, stick_norm(r.x));
-      send_axis(cls, device, GD_AXIS_LY, -stick_norm(r.y));
+      // Horizontal right Joy-Con: down/up -> left/right, left/right ->
+      // up/down. libnx reports positive Y as stick-up.
+      send_axis(cls, device, GD_AXIS_LX, stick_norm(r.y));
+      send_axis(cls, device, GD_AXIS_LY, stick_norm(r.x));
+      send_axis(cls, device, GD_AXIS_RX, 0.0f);
+      send_axis(cls, device, GD_AXIS_RY, 0.0f);
+    } else if (style & HidNpadStyleTag_NpadJoyLeft) {
+      // Horizontal left Joy-Con: up/down -> left/right and
+      // right/left -> up/down.
+      send_axis(cls, device, GD_AXIS_LX, -stick_norm(l.y));
+      send_axis(cls, device, GD_AXIS_LY, -stick_norm(l.x));
+      send_axis(cls, device, GD_AXIS_RX, 0.0f);
+      send_axis(cls, device, GD_AXIS_RY, 0.0f);
       send_axis(cls, device, GD_AXIS_RX, 0.0f);
       send_axis(cls, device, GD_AXIS_RY, 0.0f);
     } else {

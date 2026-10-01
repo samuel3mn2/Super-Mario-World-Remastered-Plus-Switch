@@ -35,6 +35,10 @@ Godot. Connect every player from the Switch controller screen before starting
 the game; each controller is delivered to the game as a separate Godot input
 device. Handheld mode and the first paired controller remain player one.
 
+Single Joy-Con controllers are supported horizontally. On the left Joy-Con,
+the stick is rotated for movement, Minus is Start, and SL/SR act as L/R. On
+the right Joy-Con, the stick is rotated for movement and SL/SR act as L/R.
+
 ### How to build
 
 You need devkitA64 (devkitPro) with these packages:
